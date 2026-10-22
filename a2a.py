@@ -1,12 +1,12 @@
-import traceback
-
 import hashlib
 import json
 import os
 import re
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -127,11 +127,26 @@ def package_id(package):
 
 
 # ---------------------------------------------------------------- AI layer
+CACHE_VERSION = os.getenv("CACHE_VERSION", "v2")
+NO_MINOR_UNIT_CURRENCIES = {"JPY", "KRW", "VND"}
+COVER_PATTERN = re.compile(
+    r"Supplier (?P<vendor>.+?); invoice (?P<invoice>\S+?); stated total (?P<currency>[A-Z]{3}) (?P<amount>[\d,]+(?:\.\d+)?)"
+)
+
+
+def model_name():
+    return os.getenv("AIPIPE_MODEL", "gpt-4.1-mini")
+
+
 def ai_client():
     token = os.getenv("AIPIPE_TOKEN")
     if not token:
         raise HTTPException(status_code=503, detail="AI service is not configured")
-    return OpenAI(base_url=os.getenv("AI_BASE_URL", "https://aipipe.org/openai/v1"), api_key=token, max_retries=0)
+    return OpenAI(
+        base_url=os.getenv("AI_BASE_URL", "https://aipipe.org/openai/v1"),
+        api_key=token,
+        max_retries=0,
+    )
 
 
 def coerce_amount(value):
@@ -146,13 +161,117 @@ def coerce_amount(value):
     return value
 
 
+def money_text(currency, amount_minor):
+    return f"{currency} {amount_minor // 100}.{amount_minor % 100:02d}"
+
+
+def build_rationale(action, facts, refs, reason):
+    reason = " ".join((reason or "").split())[:700]
+    text = (
+        f"Chosen action: {action} for invoice {facts['invoiceNumber']} from {facts['vendorName']} "
+        f"({money_text(facts['currency'], facts['amountMinor'])}). "
+        f"The controlling evidence {refs[0]}, {refs[1]} and {refs[2]} supports this action."
+    )
+    if reason:
+        text += f" {reason}"
+    return text[:1500]
+
+
+# ---- fast path: decisive paragraph is found in code, the model only picks the action
+def fast_info(package):
+    """Return {refs, paragraph, facts} when the package has exactly one paragraph with
+    three distinct bracketed refs and a parseable cover line; otherwise None."""
+    docs = package.get("documents") if isinstance(package, dict) else None
+    if not isinstance(docs, list) or not docs or not all(isinstance(d, dict) and isinstance(d.get("text"), str) for d in docs):
+        return None
+    candidates = []
+    for doc in docs:
+        for paragraph in re.split(r"\n\s*\n", doc["text"]):
+            refs = list(dict.fromkeys(REF_PATTERN.findall(paragraph)))
+            if len(refs) == 3:
+                candidates.append((refs, " ".join(paragraph.split())))
+    if len(candidates) != 1:
+        return None
+    full_text = "\n\n".join(d["text"] for d in docs)
+    match = COVER_PATTERN.search(full_text)
+    if not match:
+        return None
+    currency = match["currency"]
+    if currency in NO_MINOR_UNIT_CURRENCIES:
+        return None
+    try:
+        amount_minor = int((Decimal(match["amount"].replace(",", "")) * 100).to_integral_value())
+    except Exception:
+        return None
+    return {
+        "refs": candidates[0][0],
+        "paragraph": candidates[0][1],
+        "facts": {
+            "vendorName": match["vendor"].strip(),
+            "invoiceNumber": match["invoice"].strip(),
+            "amountMinor": amount_minor,
+            "currency": currency,
+        },
+    }
+
+
+FAST_PROMPT = """You are an accounts-payable decision agent. For each case you get ONE controlling paragraph (already isolated from noise) and the stated invoice total. Choose exactly one action from that paragraph alone.
+
+Actions:
+- settle_invoice: the records reconcile with no exception, goods are received, and no earlier payment exists for THIS invoice, and nothing in the paragraph pauses or escalates it. A prior payment to the same supplier for the same amount but a DIFFERENT invoice does NOT make a duplicate: settle.
+- request_approval: records reconcile cleanly, but the payable total is above this queue's autonomous authority / delegation ceiling, so a named approver is required.
+- hold_invoice: payment is paused until a stated verification finishes, typically a changed bank account / beneficiary / remittance instruction whose callback or out-of-band check is not complete.
+- reject_duplicate: the same commercial invoice (same supplier, invoice identity, currency, amount; differences are only OCR/punctuation/another scan) was already paid, so a second payment must be rejected.
+- open_exception: material records conflict: total outside tolerance, invoice does not reconcile with order/receipt valuation, incompatible explanations, no corrected document; needs an exception workflow.
+
+Decide from what the paragraph actually establishes, not from words that merely appear. If the paragraph raises one specific blocking issue, choose the action for that issue; if it only confirms a clean reconciliation with no issue, choose settle_invoice. When it compares a ceiling with the total, compare the numbers yourself.
+
+Return JSON only: {"decisions":[{"packageId":"...","action":"...","reason":"one or two plain sentences (max 45 words) naming the facts in the paragraph that lead to the action"}]} with exactly one decision per packageId."""
+
+
+def call_fast_model(items, timeout):
+    payload = [
+        {
+            "packageId": pid,
+            "statedTotal": money_text(info["facts"]["currency"], info["facts"]["amountMinor"]),
+            "controllingParagraph": info["paragraph"],
+        }
+        for pid, info in items
+    ]
+    completion = ai_client().with_options(timeout=timeout).chat.completions.create(
+        model=model_name(),
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": FAST_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
+        ],
+    )
+    parsed = json.loads(completion.choices[0].message.content or "{}")
+    decisions = parsed.get("decisions") if isinstance(parsed, dict) else None
+    if not isinstance(decisions, list):
+        raise ValueError("Fast model response did not contain decisions")
+    return decisions
+
+
+def fast_decision(info, item):
+    action = item.get("action") if isinstance(item, dict) else None
+    if action not in ACTIONS:
+        raise ValueError("Unsupported action")
+    reason = item.get("reason") if isinstance(item.get("reason"), str) else ""
+    return {
+        "action": action,
+        "facts": dict(info["facts"]),
+        "evidenceRefs": list(info["refs"]),
+        "rationale": build_rationale(action, info["facts"], info["refs"], reason),
+    }
+
+
+# ---- full path (fallback): the model reads the whole package
 def normalize_decision(item, expected_package_id, package):
-    """Validate a model proposal. The rationale is built in code so it always
-    names the action and cites evidence; the model only chooses action, facts
-    and evidence references."""
+    """Validate a full-package model proposal. Rationale is built in code."""
     if not isinstance(item, dict):
         raise ValueError("Model returned an invalid proposal")
-
     action = item.get("action")
     if action not in ACTIONS:
         raise ValueError("Model returned an unsupported action")
@@ -181,58 +300,46 @@ def normalize_decision(item, expected_package_id, package):
     refs = [ref.strip() for ref in refs]
     if len(set(refs)) != 3:
         raise ValueError("Evidence references must be unique")
-
     package_text = json.dumps(package, ensure_ascii=False, separators=(",", ":"))
     if any(ref not in package_text for ref in refs):
         raise ValueError("Model cited evidence absent from the invoice package")
 
-    vendor = vendor.strip()
-    invoice = invoice.strip()
-    model_reason = item.get("rationale") if isinstance(item.get("rationale"), str) else ""
-    model_reason = " ".join(model_reason.split())[:900]
-    rationale = (
-        f"Chosen action: {action} for invoice {invoice} from {vendor}. "
-        f"The decisive records {refs[0]}, {refs[1]} and {refs[2]} support this action."
-    )
-    if model_reason:
-        rationale += f" {model_reason}"
-    rationale = rationale[:1500]
-
+    clean_facts = {
+        "vendorName": vendor.strip(),
+        "invoiceNumber": invoice.strip(),
+        "amountMinor": amount_minor,
+        "currency": currency.upper(),
+    }
     return {
         "packageId": expected_package_id,
         "action": action,
-        "facts": {
-            "vendorName": vendor,
-            "invoiceNumber": invoice,
-            "amountMinor": amount_minor,
-            "currency": currency.upper(),
-        },
+        "facts": clean_facts,
         "evidenceRefs": refs,
-        "rationale": rationale,
+        "rationale": build_rationale(action, clean_facts, refs, item.get("rationale") if isinstance(item.get("rationale"), str) else ""),
     }
 
 
 SYSTEM_PROMPT = """You are an evidence-based invoice action agent for accounts payable.
-You receive several invoice packages. Each package mixes decisive records with noise: cover sheets, archived/old examples, training decoys, negated statements ("this is NOT a duplicate", "no approval needed in the old policy") and irrelevant action words. Decide from the paragraph that actually governs THIS invoice under the current policy, not from keywords.
+You receive several invoice packages. Each package mixes decisive records with noise: cover sheets, archived/old examples, training decoys, negated statements and irrelevant action words. Decide from the single paragraph that actually governs THIS invoice (it contains exactly three bracketed references), not from keywords elsewhere.
 
 Choose exactly one action per package:
-- settle_invoice: valid, reconciled, within autonomous authority.
-- request_approval: commercially valid but outside delegated authority (amount above the approver's limit).
-- hold_invoice: payment pauses until a stated verification completes (e.g. bank-detail callback, missing receipt/PO check).
-- reject_duplicate: the SAME commercial invoice (same vendor, invoice number, amount) was already paid. A payment for a different invoice is NOT a duplicate.
-- open_exception: material records conflict (amount, vendor, PO, currency mismatch) and need an exception workflow.
+- settle_invoice: valid, reconciled, within autonomous authority, no prior payment of THIS invoice (a prior payment of a DIFFERENT invoice is not a duplicate).
+- request_approval: commercially valid but the total is above the queue's delegated authority.
+- hold_invoice: payment pauses until a stated verification completes (e.g. changed bank details with the callback pending).
+- reject_duplicate: the same commercial invoice was already paid.
+- open_exception: material records conflict and need an exception workflow.
 
-Evidence: cite EXACTLY three bracketed references, copied character-for-character (including the square brackets) from the single paragraph that determines the action. Never cite the cover-sheet reference, archive examples or training decoys.
-Facts: vendorName, invoiceNumber as printed on the invoice; amountMinor is an INTEGER in minor units (paise for INR, cents for USD; 1,234.50 -> 123450); currency is the 3-letter ISO code.
+Evidence: cite EXACTLY the three bracketed references of the controlling paragraph, copied character-for-character with brackets. Never cite cover-sheet, archive or training references.
+Facts: vendorName and invoiceNumber as on the signed cover sheet; amountMinor is an INTEGER in minor units (1,234.50 -> 123450); currency is the 3-letter ISO code.
 Rationale: one or two plain sentences on why this action applies.
 
-Return JSON only, shaped as {"proposals":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["[..]","[..]","[..]"],"rationale":"..."}]} with exactly one proposal per supplied packageId and no others."""
+Return JSON only: {"proposals":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["[..]","[..]","[..]"],"rationale":"..."}]} with exactly one proposal per supplied packageId and no others."""
 
 
 def call_model(packages, timeout):
     payload = [{"packageId": package_id(pkg), "package": canonical_package(pkg)} for pkg in packages]
     completion = ai_client().with_options(timeout=timeout).chat.completions.create(
-        model=os.getenv("AIPIPE_MODEL", "openai/gpt-4.1-mini"),
+        model=model_name(),
         temperature=0,
         response_format={"type": "json_object"},
         messages=[
@@ -293,45 +400,75 @@ def build_proposals(batch, deadline):
         raise HTTPException(status_code=400, detail="Duplicate package IDs")
 
     canonical = {package_id(pkg): canonical_package(pkg) for pkg in packages}
-    hashes = {pid: json_hash(content) for pid, content in canonical.items()}
+    hashes = {pid: json_hash({"cache": CACHE_VERSION, "package": content}) for pid, content in canonical.items()}
     cached_by_hash = cache_get(set(hashes.values()))
     decisions = {pid: cached_by_hash[h] for pid, h in hashes.items() if h in cached_by_hash}
 
     pending = [pkg for pkg in packages if package_id(pkg) not in decisions]
-    for _attempt in range(2):  # one retry, only for packages that failed validation
+    for attempt in range(2):
         if not pending:
             break
-        remaining = deadline - time.monotonic()
-        if remaining < 8:
-            break
-        try:
-            items = call_model(pending, timeout=min(30.0, remaining - 3))
-        except HTTPException:
-            raise
-        except Exception:
-            traceback.print_exc()
-            continue
         pending_by_id = {package_id(pkg): pkg for pkg in pending}
-        fresh_entries = []
-        for item in items:
-            pid = item.get("packageId") if isinstance(item, dict) else None
-            if pid not in pending_by_id or pid in decisions:
-                continue
+        new_entries = []
+
+        # Attempt 0 uses the fast path where possible; the retry reads whole packages.
+        fast_items = []
+        if attempt == 0:
+            for pid, pkg in pending_by_id.items():
+                info = fast_info(pkg)
+                if info:
+                    fast_items.append((pid, info))
+        fast_ids = {pid for pid, _ in fast_items}
+
+        if fast_items and deadline - time.monotonic() >= 8:
             try:
-                decision = normalize_decision(item, pid, pending_by_id[pid])
-            except ValueError as e:
-                print("REJECTED", pid, e, json.dumps(item)[:300])
-                continue
-            decisions[pid] = decision
-            fresh_entries.append((hashes[pid], canonical[pid], decision))
+                results = call_fast_model(fast_items, timeout=min(30.0, deadline - time.monotonic() - 3))
+                info_by_id = dict(fast_items)
+                for item in results:
+                    pid = item.get("packageId") if isinstance(item, dict) else None
+                    if pid not in info_by_id or pid in decisions:
+                        continue
+                    try:
+                        decisions[pid] = fast_decision(info_by_id[pid], item)
+                    except ValueError as exc:
+                        print("FAST REJECTED", pid, exc)
+                        continue
+                    new_entries.append((hashes[pid], canonical[pid], decisions[pid]))
+            except HTTPException:
+                raise
+            except Exception:
+                traceback.print_exc()
+
+        slow = [pkg for pid, pkg in pending_by_id.items() if pid not in fast_ids and pid not in decisions]
+        if attempt == 1:
+            slow = [pkg for pid, pkg in pending_by_id.items() if pid not in decisions]
+        if slow and deadline - time.monotonic() >= 8:
+            slow_by_id = {package_id(pkg): pkg for pkg in slow}
+            try:
+                items = call_model(slow, timeout=min(30.0, deadline - time.monotonic() - 3))
+                for item in items:
+                    pid = item.get("packageId") if isinstance(item, dict) else None
+                    if pid not in slow_by_id or pid in decisions:
+                        continue
+                    try:
+                        decision = normalize_decision(item, pid, slow_by_id[pid])
+                    except ValueError as exc:
+                        print("REJECTED", pid, exc, json.dumps(item)[:300])
+                        continue
+                    decisions[pid] = decision
+                    new_entries.append((hashes[pid], canonical[pid], decision))
+            except HTTPException:
+                raise
+            except Exception:
+                traceback.print_exc()
+
         try:
-            cache_put(fresh_entries)
+            cache_put(new_entries)
         except Exception:
-            pass  # caching is an optimization; never fail the request over it
+            traceback.print_exc()  # caching is an optimization; never fail the request over it
         pending = [pkg for pkg in pending if package_id(pkg) not in decisions]
 
     if pending:
-        # Successful decisions are already cached, so a retry only redoes these.
         raise HTTPException(status_code=502, detail="Invoice decision service failed")
 
     proposals = []
