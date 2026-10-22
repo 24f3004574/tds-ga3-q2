@@ -129,14 +129,14 @@ def package_id(package):
 # ---------------------------------------------------------------- AI layer
 def ai_client():
     def ai_client():
-    token = os.getenv("AIPIPE_TOKEN")
-    if not token:
-        raise HTTPException(status_code=503, detail="AI service is not configured")
-    return OpenAI(
-        base_url=os.getenv("AI_BASE_URL", "https://aipipe.org/openai/v1"),
-        api_key=token,
-        max_retries=0,
-    )
+        token = os.getenv("AIPIPE_TOKEN")
+        if not token:
+            raise HTTPException(status_code=503, detail="AI service is not configured")
+        return OpenAI(
+            base_url=os.getenv("AI_BASE_URL", "https://aipipe.org/openai/v1"),
+            api_key=token,
+            max_retries=0,
+        )
 
 
 def coerce_amount(value):
